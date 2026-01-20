@@ -139,7 +139,7 @@ void printDevices() {
     for (int i = 0; i < devCount; i++)
         if (now - devices[i].lastSeen < 2000) active++;
     
-    uBit.serial.printf("\r\n=== DEVICES (%d) ===\r\n", active);
+    uBit.serial.printf("begin\r\n");
     for (int i = 0; i < devCount; i++) {
         if (now - devices[i].lastSeen < 2000) {
             if (devices[i].name[0]) {
@@ -153,7 +153,7 @@ void printDevices() {
             }
         }
     }
-    uBit.serial.printf("====================\r\n");
+    uBit.serial.printf("end\r\n");
 }
 
 // sends the request for the devices class name. This is the ID that is the same for devices that are the same

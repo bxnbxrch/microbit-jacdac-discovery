@@ -1,6 +1,6 @@
 add_custom_command(
     OUTPUT "${PROJECT_SOURCE_DIR}/${codal.output_folder}/${device.device}.bin"
-    COMMAND "${ARM_NONE_EABI_OBJCOPY}" -O binary "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${device.device}" "${PROJECT_SOURCE_DIR}/${codal.output_folder}/${device.device}.bin"
+    COMMAND "${ARM_NONE_EABI_OBJCOPY}" -O binary "$<TARGET_FILE:${device.device}>" "${PROJECT_SOURCE_DIR}/${codal.output_folder}/${device.device}.bin"
     DEPENDS  ${device.device}
     COMMENT "converting to bin file."
 )

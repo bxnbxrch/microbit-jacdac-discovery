@@ -1,6 +1,6 @@
 add_custom_command(
     OUTPUT "${PROJECT_SOURCE_DIR}/${codal.output_folder}/${device.device}.hex"
-    COMMAND "${ARM_NONE_EABI_OBJCOPY}" -O ihex "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${device.device}" "${PROJECT_SOURCE_DIR}/${codal.output_folder}/${device.device}.hex"
+    COMMAND "${ARM_NONE_EABI_OBJCOPY}" -O ihex "$<TARGET_FILE:${device.device}>" "${PROJECT_SOURCE_DIR}/${codal.output_folder}/${device.device}.hex"
     DEPENDS  ${device.device}
     COMMENT "converting to hex file."
 )

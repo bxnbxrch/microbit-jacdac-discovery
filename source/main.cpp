@@ -1,6 +1,8 @@
 /*
     Ben Birch
 
+    v2.0 (hopefully final version)
+
     Jacdac Scanner for micro:bit v2
 
     This scans the bus for connected devices and prints their deivce class over serial.
@@ -20,200 +22,79 @@
     painless than i expected and it even worked first try. (skill not luck)
 
 
+    UPDATE:
+
+    I was wrong. It needed a full rewrite which took a full day.
+    Basically, I wasnt getting the actual device ID in the response, i was misinterpreting a service packet, so it was the same for some devices
+    which made me think it was working.
+
+    Now, i have properly looked through codal-jacdac and implemented the protocol correctly. 
+    Now, it scans all device IDs and requests the  product identifier for each one individually.
+
 
 
 */
 
 
+
 #include "MicroBit.h"
 #include "ZSingleWireSerial.h"
 
+// Config
+#define MAX_DEVICES         16
+#define DEVICE_TIMEOUT_MS   5000
+#define REQUEST_INTERVAL_MS 500
+#define PRINT_INTERVAL_MS   1000
 
-// main loop
-#define RX_TIMEOUT_MS        5
-#define PRINT_INTERVAL_MS    1000
-#define MAIN_LOOP_SLEEP_MS   1
-
-// jacdac frames
-#define FRAME_FLAG           0xF8
-#define MAX_FRAME_FLAGS      4
-
-// jaccdac offsets
-#define ID_OFFSET            4
-#define SERVICE_INDEX_OFFSET 13
-#define SERVICE_OP_OFFSET    14
-#define NAME_OFFSET          16
-#define DESC_OFFSET          20
-
-// service operations
-#define SVC_OP_ANNOUNCE              0x0000
-#define SVC_OP_DEVICE_NAME_RESPONSE  0x8180
-
-
+// Jacdac protocol constants
+#define JD_CMD_ANNOUNCE     0x0000      // announce command identifier ( when a device announces itsself it will broadcast this )
+#define JD_CMD_GET_PID      0x1181      // get product identifier command identifier
+#define JD_FLAG_COMMAND     0x01        // the command flag, use this when sending a command e.g. get_product_identifier
 
 
 MicroBit uBit;
 ZSingleWireSerial *sws;
 
-// recieve buffer
-uint8_t rxBuf[256];
 
-// flags
-volatile bool rxDone, rxBusy;
-
-// max devices
-#define MAX_DEVICES 16
-
-
-// struct with id, desc, lastSeen, name to clean up code a bit
-struct DeviceInfo {
-    // UUID
-    uint64_t id;
-    
-    // class name
-    char name[32];
-
-    // device descriptor
-    uint32_t desc;
-
-    // timestamps
-    uint32_t lastSeen;
-    uint32_t devReqTime;
-
-    // has the get device class name request been sent
-    bool devReqSent;
+// Device struct for storage
+struct Device { 
+    uint64_t id; 
+    uint32_t pid; 
+    uint32_t lastSeen, lastReq; 
+    bool havePid; 
 };
 
+Device devices[MAX_DEVICES];
+int deviceCount = 0;
 
-DeviceInfo devices[MAX_DEVICES];
+uint8_t rxBuf[256], txBuf[16];
+volatile bool rxBusy = false, rxDone = false, txDone = false;
 
-int devCount = 0;
-bool changed = false;
-
-
-void listen();
-
-
-// mbit serial doesnt like printing hex
-// quick function to print hex
-template<typename T>
-void printHex(T val){
-    const char hex[] = "0123456789ABCDEF";
-    uint8_t *p = (uint8_t*)&val;
-    for (int i = sizeof(T) - 1; i >= 0; i--)
-        uBit.serial.printf("%c%c", hex[p[i] >> 4], hex[p[i] & 0xF]);
+// Print hex values
+void printHex64(uint64_t v) {
+    const char *h = "0123456789ABCDEF";
+    for (int i = 60; i >= 0; i -= 4) uBit.serial.printf("%c", h[(v >> i) & 0xF]);
 }
 
-// this is called when we see any message from a device.
-// if the device is new:
-//  add it to the list
-
-// if the deivice is known:
-//  update its last seen time to maintain list
-void sawDevice(uint64_t id, uint32_t desc) {
-    if (!id) return;
-
-    uint32_t now = system_timer_current_time();
-
-    for (int i = 0; i < devCount; i++) {
-        if (devices[i].id == id) {
-            devices[i].lastSeen = now;
-            if (desc) devices[i].desc = desc;
-            return;
-        }
-    }
-
-    if (devCount >= MAX_DEVICES) return;
-    devices[devCount++] = { id, "", desc, now, 0, false };
-
-    changed = true;
+void printHex32(uint32_t v) {
+    const char *h = "0123456789ABCDEF";
+    for (int i = 28; i >= 0; i -= 4) uBit.serial.printf("%c", h[(v >> i) & 0xF]);
 }
 
 
-// print the list to serial
-// also maintains the list by removing stale devices
-// (those not seen for more than 2 seconds)
-void printDevices() {
-    uint32_t now = system_timer_current_time();
-    int active = 0;
-    for (int i = 0; i < devCount; i++)
-        if (now - devices[i].lastSeen < 2000) active++;
-    
-    uBit.serial.printf("begin\r\n");
-    for (int i = 0; i < devCount; i++) {
-        if (now - devices[i].lastSeen < 2000) {
-            if (devices[i].name[0]) {
-                uBit.serial.printf("%s\r\n", devices[i].name);
-            } else if (devices[i].desc) {
-                printHex(devices[i].desc);
-                uBit.serial.printf("\r\n");
-            } else {
-                printHex(devices[i].id);
-                uBit.serial.printf("\r\n");
-            }
-        }
-    }
-    uBit.serial.printf("end\r\n");
+// swiped this from codal-jacdac
+uint16_t crc16(const uint8_t *d, int len) {
+    uint16_t crc = 0xFFFF;
+    while (len--) { uint8_t x = (crc >> 8) ^ *d++; x ^= x >> 4; crc = (crc << 8) ^ (x << 12) ^ (x << 5) ^ x; }
+    return crc;
 }
 
-// sends the request for the devices class name. This is the ID that is the same for devices that are the same
-// e.g. two temperature sensors will have the same device class name
-// This allows us to differentiate devices which have the same services but differnet footprints 
-void sendGetDeviceClassName(uint64_t targetId) {
-    uint8_t pkt[20] = {0};
-    pkt[0] = 0x00; 
-    pkt[1] = 0x00; 
-    pkt[2] = 0x0C; 
-    pkt[3] = 0x00; 
-    pkt[12] = 0x00;
-    pkt[13] = 0x00;
-    pkt[14] = 0x80;
-    pkt[15] = 0x01;
-
-    memcpy(pkt + 4, &targetId, 8); // place the target id in the packet
-    sws->sendDMA(pkt, 16);
-}
-
-// if a device doenst have a name, and iasnt stale, try send a request for its name
-// only send one request every 500ms per device, and not if we are already waiting for a response
-void trySendRequests() {
-    uint32_t now = system_timer_current_time();
-    if (rxBusy) return;
-    for (int i = 0; i < devCount; i++) {
-        if (!devices[i].name[0] && (now - devices[i].lastSeen < 2000)) {
-            if (!devices[i].devReqSent || (now - devices[i].devReqTime > 500)) {
-                devices[i].devReqSent = true;
-                devices[i].devReqTime = now;
-                sendGetDeviceClassName(devices[i].id);
-                fiber_sleep(2);
-                listen();
-                break;
-            }
-        }
-    }
-}
-// IRQ handler for when data is recieved. 
-// this has to be as small as possible due to 1Mbps
-// sets rxDone flag when a full packet is recieved
-void onRx(uint16_t e) { if (e == SWS_EVT_DATA_RECEIVED || e == SWS_EVT_ERROR) rxDone = true; }
-
-
-// IRQ handler for falling edge on the bus
-// starts a DMA recieve into rxbuf
-void onFall(int v) {
-    if (v || rxBusy) return;
-    sws->p.eventOn(DEVICE_PIN_EVENT_NONE);
-    rxBusy = true;
-    sws->receiveDMA(rxBuf, 256);
-}
-
-// set up to listen for packets
+// set up to listen for incoming packets
+// aborts any ongoing DMA operations
+// configures pin interrupts
+// sets rxBusy/rxDone flags
 void listen() {
-
-    // reset flags
     sws->abortDMA();
-    
-    // set up for next recieve
     sws->setMode(SingleWireDisconnected);
     sws->p.setDigitalValue(1);
     sws->p.getDigitalValue(PullMode::Up);
@@ -221,106 +102,219 @@ void listen() {
     rxBusy = rxDone = false;
 }
 
+// IRQ handler for SWS events
+void onSwsEvent(uint16_t e) {
+    if (e == SWS_EVT_DATA_RECEIVED || e == SWS_EVT_ERROR) rxDone = true;
+    if (e == SWS_EVT_DATA_SENT) txDone = true;
+}
+
+// IRQ handler for falling edge on SWS pin
+// starts a receive DMA if not already busy
+void onFall(int v) {
+    if (v || rxBusy) return;
+    sws->p.eventOn(DEVICE_PIN_EVENT_NONE);
+    rxBusy = true;
+    sws->receiveDMA(rxBuf, sizeof(rxBuf));
+}
+
+
+// send a get_product_identifier request to the given targetId
+// PACKET STRUCTURE:
+/*
+example from jacdac docs:
+
+Bytes	Value	Offset	Size	Name	Description
+568c	0x8c56	0	2	frame_crc	CRC
+04	4	2	1	frame_size	Size of the data field in bytes.
+01		3	1	frame_flags	Flags specific to this frame.
+39dca0a9a6a1cad3		4	8	device_identifiter	64-bit device identifier
+00	0	12	1	packet_size	The size of the payload field. Maximum size is 236 bytes.
+00	0	13	1	service_index	A number that specifies an operation and code combination.
+8111	0x1181	14	2	service_command	Identifier for the command
+
+yeah this was painful i cant lie
+
+
+
+*/
+
+
+#define JD_FRAME_SIZE_OFFSET        2
+#define JD_FLAG_OFFSET              3
+#define JD_DEVICE_IDENTIFIER_OFFSET 4
+#define JD_PACKET_SIZE_OFFSET       12
+#define JD_SERVICE_INDEX_OFFSET     13
+#define JD_SERVICE_COMMAND_OFFSET   14
+
+
+
+void sendPidRequest(uint64_t targetId) {
+
+    // build jacdac frame
+    memset(txBuf, 0, 16);
+    txBuf[JD_FRAME_SIZE_OFFSET] = 0x04;           
+    txBuf[JD_FLAG_OFFSET] = JD_FLAG_COMMAND;
+    memcpy(txBuf + JD_DEVICE_IDENTIFIER_OFFSET, &targetId, 8);
+    txBuf[JD_SERVICE_COMMAND_OFFSET] = JD_CMD_GET_PID & 0xFF;
+    txBuf[JD_SERVICE_COMMAND_OFFSET + 1] = JD_CMD_GET_PID >> 8;
+    uint16_t c = crc16(txBuf + 2, 14);
+    txBuf[0] = c & 0xFF;
+    txBuf[1] = c >> 8;
+
+    // prepare the bus
+    sws->abortDMA();
+    // disable interrupts while transmitting
+    sws->p.eventOn(DEVICE_PIN_EVENT_NONE);
+    rxBusy = rxDone = false;
+    sws->setMode(SingleWireDisconnected);
+
+    if (sws->p.getDigitalValue() == 0) { listen(); return; }
+
+    // send break
+    sws->p.setDigitalValue(0); target_wait_us(11);
+    sws->p.setDigitalValue(1); target_wait_us(50);
+
+    // send packet
+    txDone = false;
+    sws->sendDMA(txBuf, 16);
+    uint32_t txStart = system_timer_current_time();
+    while (!txDone && (system_timer_current_time() - txStart) < 10);
+    if (!txDone) sws->abortDMA();
+
+    // re-enable interrupts and set up to receive response
+    sws->setMode(SingleWireDisconnected);
+    sws->p.setDigitalValue(0); target_wait_us(11);
+    sws->p.setDigitalValue(1);
+    sws->p.getDigitalValue(PullMode::Up);
+    sws->p.eventOn(DEVICE_PIN_INTERRUPT_ON_EDGE);
+}
+
+// this is called when we see a device announce itsslef
+// gets timestamp, and sets its last seen
+// if new device, instanciates a new device based on the id and adds to list
+void sawDevice(uint64_t id) {
+    if (!id) return;
+    uint32_t now = system_timer_current_time();
+    for (int i = 0; i < deviceCount; i++)
+        if (devices[i].id == id) { devices[i].lastSeen = now; return; }
+    if (deviceCount < MAX_DEVICES)
+        devices[deviceCount++] = {id, 0, now, 0, false};
+}
+
+// process a received packet
+// looks for announce packets and pid response packets
+// updates device list accordingly
+void processRx() {
+    // find start of packet
+    // there are some 0xF8 bytes at the start that we need to skip passt
+    // these are idle bytes detected after the initial break signal for a few ms
+    int off = 0;
+    while (off < 4 && rxBuf[off] == 0xF8) off++;
+    uint8_t *p = rxBuf + off;
+    if (p[0] == 0 && p[2] == 0) return;
+
+
+    // extract id and cmd from packet
+    uint64_t id; 
+    memcpy(&id, p + 4, 8);
+    uint16_t cmd = p[14] | (p[15] << 8);
+
+    // process based on cmd
+    // if announce, call sawDevice
+    // if get_pid response, extract pid and update device entry
+    if (p[13] == 0 && cmd == JD_CMD_ANNOUNCE) sawDevice(id);
+    else if (p[13] == 0 && cmd == JD_CMD_GET_PID) {
+        uint32_t pid; memcpy(&pid, p + 16, 4);
+        for (int i = 0; i < deviceCount; i++)
+            if (devices[i].id == id) {
+                devices[i].pid = pid;
+                devices[i].havePid = true;
+                devices[i].lastSeen = system_timer_current_time();
+                break;
+            }
+    }
+}
+
+// send get_product_identifier requests to devices that we have seen but dont yet have a pid for
+void trySendRequests() {
+    if (rxBusy) return;
+    uint32_t now = system_timer_current_time();
+    for (int i = 0; i < deviceCount; i++) {
+        if (
+            devices[i].havePid || 
+            now - devices[i].lastSeen > DEVICE_TIMEOUT_MS || 
+            now - devices[i].lastReq < REQUEST_INTERVAL_MS
+        ) continue;
+
+        devices[i].lastReq = now;
+        sendPidRequest(devices[i].id);
+        fiber_sleep(2); // this is needed so that we dont try and read our own transmission. 2 is arbitrary but works
+        return;
+    }
+}
+
+// serial prints
+void printDevices() {
+    uBit.serial.printf("begin\r\n");
+    uint32_t now = system_timer_current_time();
+    for (int i = 0; i < deviceCount; i++) {
+        if (now - devices[i].lastSeen > DEVICE_TIMEOUT_MS) continue;
+        printHex64(devices[i].id);
+        uBit.serial.printf("-");
+        if (devices[i].havePid) printHex32(devices[i].pid);
+        else uBit.serial.printf("unknown");
+        uBit.serial.printf("\r\n");
+    }
+    uBit.serial.printf("end\r\n");
+}
 
 
 
 int main() {
-
-    // initialise and set up serial
+    // init micro:bit runtime
     uBit.init();
+
+    // setup serial for outputting list
     uBit.serial.setBaud(115200);
-    uBit.serial.printf("\r\nJacdac Scanner\r\n");
 
-    // set up single wire serial on pin P12
+    // set up single wire serial.
+    // cant just bit bang on the built in uart at 1Mbps reliably
+    // believe me i tried.
     sws = new ZSingleWireSerial(uBit.io.P12);
-    
-    // 1Mbps
     sws->setBaud(1000000);
-
-    // setup IRQs
     sws->p.setIRQ(onFall);
-    sws->setIRQ(onRx);
-
-    // sniff
+    sws->setIRQ(onSwsEvent);
     listen();
 
-    uint32_t rxTime = 0;
-    uint32_t printTime = 0;
+    uint32_t rxDeadline = 0, lastPrint = 0;
 
     while (1) {
-        uint32_t now = system_timer_current_time();
 
-        // rx timeout handling
+        // handle receive timeout
+        uint32_t now = system_timer_current_time();
         if (rxBusy && !rxDone) {
-            if (!rxTime)
-                rxTime = now + RX_TIMEOUT_MS;
-            else if (now > rxTime) {
-                listen();
-                rxTime = 0;
-            }
+            if (!rxDeadline) rxDeadline = now + 20;
+            else if (now > rxDeadline) { listen(); rxDeadline = 0; }
         }
 
-        // rx packet processing
+        // process received packet
         if (rxDone) {
             rxDone = false;
-
-            // skip jacadc frame flags 
-            int off = 0;
-            while (off < MAX_FRAME_FLAGS && rxBuf[off] == FRAME_FLAG)
-                off++;
-
-            uint8_t* pkt = rxBuf + off;
-
-            uint8_t svcIdx = pkt[SERVICE_INDEX_OFFSET];
-            uint16_t svcOp =
-                pkt[SERVICE_OP_OFFSET] |
-                (pkt[SERVICE_OP_OFFSET + 1] << 8);
-
-            // Control service: device name response
-            if (svcIdx == 0 && svcOp == SVC_OP_DEVICE_NAME_RESPONSE) {
-                uint64_t id;
-                memcpy(&id, pkt + ID_OFFSET, 8);
-
-                for (int i = 0; i < devCount; i++) {
-                    if (devices[i].id == id) {
-                        const char* name = (const char*)(pkt + NAME_OFFSET);
-                        int j = 0;
-                        while (name[j] && j < 31) {
-                            devices[i].name[j] = name[j];
-                            j++;
-                        }
-                        devices[i].name[j] = 0;
-                        changed = true;
-                        break;
-                    }
-                }
-            }
-            // Control service: announce packet
-            else if (svcIdx == 0 && svcOp == SVC_OP_ANNOUNCE) {
-                uint64_t id;
-                uint32_t desc;
-                memcpy(&id,   pkt + ID_OFFSET,   8);
-                memcpy(&desc, pkt + DESC_OFFSET, 4);
-                sawDevice(id, desc);
-            }
-
+            processRx();
             memset(rxBuf, 0, sizeof(rxBuf));
             listen();
-            rxTime = 0;
+            rxDeadline = 0;
         }
 
+        // if any devices dont have a pid or an open request, try send one
         trySendRequests();
 
-        // Print every 2 seconds
-        if (changed || now - printTime > PRINT_INTERVAL_MS) {
-            printTime = now;
-            if (changed || devCount)
-                printDevices();
-            changed = false;
+        // print device list periodically
+        if (now - lastPrint > PRINT_INTERVAL_MS) {
+            lastPrint = now;
+            if (deviceCount) printDevices();
         }
 
-        uBit.sleep(MAIN_LOOP_SLEEP_MS);
+        uBit.sleep(1);
     }
 }
-
-

@@ -42,9 +42,9 @@
 
 // Config
 #define MAX_DEVICES         16
-#define DEVICE_TIMEOUT_MS   5000
+#define DEVICE_TIMEOUT_MS   2500
 #define REQUEST_INTERVAL_MS 500
-#define PRINT_INTERVAL_MS   1000
+#define PRINT_INTERVAL_MS   2500
 
 // Jacdac protocol constants
 #define JD_CMD_ANNOUNCE     0x0000      // announce command identifier ( when a device announces itsself it will broadcast this )
@@ -312,7 +312,7 @@ int main() {
         // print device list periodically
         if (now - lastPrint > PRINT_INTERVAL_MS) {
             lastPrint = now;
-            if (deviceCount) printDevices();
+            printDevices();
         }
 
         uBit.sleep(1);
